@@ -1,0 +1,11 @@
+spec_version: 1
+name: procureflow_env
+version: 0.1.0
+type: space
+runtime: fastapi
+app: server.app:app
+entrypoint: app.server:app
+observation_model: app.models.ObservationModel
+action_model: app.models.ActionModel
+reward_model: app.models.RewardModel
+port: 7860
