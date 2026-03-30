@@ -1,10 +1,9 @@
-"""Submission inference runner using the OpenAI client and required environment variables."""
-
 from __future__ import annotations
 
 import json
 import os
 from pathlib import Path
+import re
 from typing import Any
 
 from dotenv import load_dotenv
@@ -15,135 +14,175 @@ from app.models import ActionModel
 from app.server import app
 
 
+# --- Load env ---
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 API_BASE_URL = os.getenv("API_BASE_URL")
 MODEL_NAME = os.getenv("MODEL_NAME")
 HF_TOKEN = os.getenv("HF_TOKEN")
 
-ACTION_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "action_type": {
-            "type": "string",
-            "enum": ["select_vendor", "approve", "reject", "escalate", "request_info"],
-        },
-        "vendor_id": {"type": ["string", "null"]},
-        "decision": {"type": ["string", "null"]},
-        "message": {"type": ["string", "null"]},
-    },
-    "required": ["action_type"],
-    "additionalProperties": False,
-}
-
 
 def _require_env(name: str, value: str | None) -> str:
-    """Require a submission environment variable."""
     if value:
         return value
-    raise RuntimeError(f"{name} is required for inference.")
+    raise RuntimeError(f"{name} is required")
 
 
+# --- Extract JSON safely ---
 def _extract_json(text: str) -> dict[str, Any]:
-    """Extract a JSON object from model output."""
     text = text.strip()
+
     if text.startswith("```"):
         lines = text.splitlines()
         text = "\n".join(line for line in lines if not line.startswith("```"))
-        text = text.strip()
-    return json.loads(text)
+
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        raise ValueError(f"No JSON found: {text}")
+
+    return json.loads(match.group())
 
 
+# --- Prompt ---
 def _build_prompt(observation: dict[str, Any], state: dict[str, Any]) -> str:
-    """Construct a deterministic procurement decision prompt."""
     return (
-        "You are a procurement operations assistant. Return exactly one JSON object for the next action.\n\n"
-        f"Observation:\n{json.dumps(observation, indent=2)}\n\n"
-        f"State:\n{json.dumps(state, indent=2)}\n\n"
-        "Decision policy:\n"
-        "- If missing_fields is non-empty, action_type must be request_info.\n"
-        "- When choosing a vendor, select the lowest-priced vendor with rating >= 4.0.\n"
-        "- For policy decisions, if budget <= policy_limit choose approve, otherwise choose escalate.\n"
-        "- For approve/reject/escalate, set decision equal to action_type.\n"
-        "- Use null for unused optional fields.\n"
+        "Return ONLY a JSON object.\n\n"
+        f"Observation:\n{json.dumps(observation)}\n\n"
+        f"State:\n{json.dumps(state)}\n\n"
+        "Rules:\n"
+        "- If missing_fields not empty → request_info\n"
+        "- Select lowest price vendor with rating >= 4.0\n"
+        "- If budget <= policy_limit → approve else escalate\n"
+        "- action_type must be one of: select_vendor, approve, reject, escalate, request_info\n"
+        "- No explanation, only JSON\n"
     )
 
 
-def _build_client() -> OpenAI:
-    """Construct the OpenAI client from submission environment variables."""
-    base_url = _require_env("API_BASE_URL", API_BASE_URL)
-    api_key = _require_env("HF_TOKEN", HF_TOKEN)
-    return OpenAI(base_url=base_url, api_key=api_key)
-
-
+# --- Normalize (CORE FIX) ---
 def _normalize_action(payload: dict[str, Any]) -> dict[str, Any]:
-    """Normalize model output into the exact action contract expected by the API."""
     action_type = payload.get("action_type") or payload.get("action") or payload.get("type")
+
+    # map invalid names
+    mapping = {
+        "choose_vendor": "select_vendor",
+        "vendor_selection": "select_vendor",
+        "evaluate_vendors": "select_vendor",
+    }
+    action_type = mapping.get(action_type, action_type)
+
+    valid = {"select_vendor", "approve", "reject", "escalate", "request_info"}
+    if action_type not in valid:
+        action_type = "request_info"
+
+    # --- vendor extraction ---
+    vendor_id = payload.get("vendor_id")
+
+    # from selected_vendor
+    if not vendor_id and "selected_vendor" in payload:
+        selected = payload.get("selected_vendor")
+        if isinstance(selected, dict):
+            vendor_id = selected.get("vendor_id")
+
+    # from vendors list (deterministic logic)
+    if not vendor_id and "vendors" in payload:
+        vendors = payload.get("vendors", [])
+        if isinstance(vendors, list) and vendors:
+            valid_vendors = [v for v in vendors if v.get("rating", 0) >= 4.0]
+            if valid_vendors:
+                best = min(valid_vendors, key=lambda x: x.get("price", float("inf")))
+                vendor_id = best.get("vendor_id") or best.get("name")
+
+    # final safety
+    if action_type == "select_vendor" and not vendor_id:
+        action_type = "request_info"
+
+    # decision
+    decision = payload.get("decision")
+    if action_type in {"approve", "reject", "escalate"}:
+        decision = action_type
+
+    if action_type == "select_vendor":
+        decision = None
+
     normalized = {
         "action_type": action_type,
-        "vendor_id": payload.get("vendor_id"),
-        "decision": payload.get("decision"),
+        "vendor_id": vendor_id,
+        "decision": decision,
         "message": payload.get("message"),
     }
-    if normalized["action_type"] in {"approve", "reject", "escalate"} and not normalized["decision"]:
-        normalized["decision"] = normalized["action_type"]
-    return ActionModel(**normalized).model_dump()
+
+    try:
+        return ActionModel(**normalized).model_dump()
+    except Exception as e:
+        print("NORMALIZATION ERROR:", normalized, e)
+        return {
+            "action_type": "request_info",
+            "vendor_id": None,
+            "decision": None,
+            "message": "fallback",
+        }
 
 
-def _next_action(client: OpenAI, observation: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
-    """Request the next action from the configured model endpoint."""
-    model_name = _require_env("MODEL_NAME", MODEL_NAME)
+# --- LLM call ---
+def _next_action(observation: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    model = _require_env("MODEL_NAME", MODEL_NAME)
+    token = _require_env("HF_TOKEN", HF_TOKEN)
+    base = _require_env("API_BASE_URL", API_BASE_URL)
+
+    client = OpenAI(api_key=token, base_url=base)
+
     prompt = _build_prompt(observation, state)
 
-    response = client.responses.create(
-        model=model_name,
-        input=prompt,
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": "procureflow_action",
-                "schema": ACTION_SCHEMA,
-                "strict": True,
-            }
-        },
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        max_tokens=300,
     )
-    return _normalize_action(_extract_json(response.output_text))
+
+    text = response.choices[0].message.content
+    print("RAW OUTPUT:", text)
+
+    parsed = _extract_json(text)
+    return _normalize_action(parsed)
 
 
-def _run_task(api_client: TestClient, llm_client: OpenAI, task_id: str) -> float:
-    """Run one task end to end against the local environment API."""
-    reset_response = api_client.post("/reset", json={"task_id": task_id})
-    reset_response.raise_for_status()
-    payload = reset_response.json()
+# --- Run task ---
+def _run_task(api_client: TestClient, task_id: str) -> float:
+    reset = api_client.post("/reset", json={"task_id": task_id})
+    reset.raise_for_status()
+
+    payload = reset.json()
     observation = payload["observation"]
     state = payload["state"]
 
     for _ in range(6):
-        action = _next_action(llm_client, observation, state)
-        step_response = api_client.post("/step", json=action)
-        if step_response.status_code >= 400:
-            raise RuntimeError(
-                f"Inference produced invalid action for task '{task_id}': {action}. Response: {step_response.text}"
-            )
-        step_payload = step_response.json()
-        observation = step_payload["observation"]
-        state = step_payload["state"]
-        if step_payload["done"]:
+        action = _next_action(observation, state)
+
+        step = api_client.post("/step", json=action)
+        if step.status_code >= 400:
+            raise RuntimeError(f"Invalid action: {action} -> {step.text}")
+
+        step_data = step.json()
+        observation = step_data["observation"]
+        state = step_data["state"]
+
+        if step_data["done"]:
             break
 
-    grader_response = api_client.post("/grader")
-    grader_response.raise_for_status()
-    return float(grader_response.json()["score"])
+    grader = api_client.post("/grader")
+    grader.raise_for_status()
+
+    return float(grader.json()["score"])
 
 
+# --- Main ---
 def run_inference() -> dict[str, float]:
-    """Evaluate all tasks and return reproducible scores."""
-    llm_client = _build_client()
     with TestClient(app) as api_client:
         scores = {
-            "easy": _run_task(api_client, llm_client, "easy_policy"),
-            "medium": _run_task(api_client, llm_client, "medium_vendor_selection"),
-            "hard": _run_task(api_client, llm_client, "hard_procurement_workflow"),
+            "easy": _run_task(api_client, "easy_policy"),
+            "medium": _run_task(api_client, "medium_vendor_selection"),
+            "hard": _run_task(api_client, "hard_procurement_workflow"),
         }
 
     scores["average"] = sum(scores.values()) / len(scores)

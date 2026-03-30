@@ -112,6 +112,32 @@ def run_grader() -> GraderResponse:
     """Return the deterministic score for the current episode."""
     return GraderResponse(score=ENV.grade())
 
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
+
+@app.get("/metadata")
+def metadata():
+    return {
+        "name": "ProcureFlow Environment",
+        "description": "OpenEnv-compatible simulation environment for procurement workflows"
+    }
+
+@app.get("/schema")
+def schema():
+    return {
+        "action": {"type": "object"},
+        "observation": {"type": "object"},
+        "state": {"type": "object"}
+    }
+
+@app.post("/mcp")
+def mcp():
+    return {
+        "jsonrpc": "2.0",
+        "result": {},
+        "id": 1
+    }
 
 def main() -> None:
     """Entrypoint for local development."""

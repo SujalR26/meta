@@ -1,16 +1,11 @@
 ---
 title: ProcureFlowEnv
-emoji: ??
+emoji: 🚀
 colorFrom: blue
 colorTo: green
 sdk: docker
 app_port: 7860
 pinned: false
-tags:
-  - openenv
-  - procurement
-  - fastapi
-  - docker
 ---
 
 # ProcureFlowEnv
@@ -184,4 +179,4 @@ If the `openenv` CLI is available in your environment, run:
 openenv validate
 ```
 
-The built-in API endpoint `POST /baseline` remains fully local and does not require any external API key.
+The built-in API endpoint `POST /baseline` remains fully local and does not require any external API key .
