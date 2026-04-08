@@ -189,7 +189,9 @@ def _next_action(observation: dict[str, Any], state: dict[str, Any]) -> dict[str
 
 
 # --- Run task ---
-def _run_task(api_client: TestClient, task_id: str) -> float:
+def _run_task(api_client: TestClient, task_id: str, task_name: str) -> float:
+    print(f"[START] task={task_name}", flush=True)
+
     reset = api_client.post("/reset", json={"task_id": task_id})
     reset.raise_for_status()
 
@@ -197,7 +199,8 @@ def _run_task(api_client: TestClient, task_id: str) -> float:
     observation = payload["observation"]
     state = payload["state"]
 
-    for _ in range(6):
+    steps_taken = 0
+    for step_idx in range(1, 7):
         action = _next_action(observation, state)
 
         step = api_client.post("/step", json=action)
@@ -205,6 +208,10 @@ def _run_task(api_client: TestClient, task_id: str) -> float:
             raise RuntimeError(f"Invalid action: {action} -> {step.text}")
 
         step_data = step.json()
+        reward = float(step_data.get("reward", 0.0))
+        print(f"[STEP] task={task_name} step={step_idx} reward={reward}", flush=True)
+
+        steps_taken = step_idx
         observation = step_data["observation"]
         state = step_data["state"]
 
@@ -214,16 +221,18 @@ def _run_task(api_client: TestClient, task_id: str) -> float:
     grader = api_client.post("/grader")
     grader.raise_for_status()
 
-    return float(grader.json()["score"])
+    score = float(grader.json()["score"])
+    print(f"[END] task={task_name} score={score} steps={steps_taken}", flush=True)
+    return score
 
 
 # --- Main ---
 def run_inference() -> dict[str, float]:
     with TestClient(app) as api_client:
         scores = {
-            "easy": _run_task(api_client, "easy_policy"),
-            "medium": _run_task(api_client, "medium_vendor_selection"),
-            "hard": _run_task(api_client, "hard_procurement_workflow"),
+            "easy": _run_task(api_client, "easy_policy", "easy"),
+            "medium": _run_task(api_client, "medium_vendor_selection", "medium"),
+            "hard": _run_task(api_client, "hard_procurement_workflow", "hard"),
         }
 
     scores["average"] = sum(scores.values()) / len(scores)
