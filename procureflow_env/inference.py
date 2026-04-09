@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 import re
 from typing import Any
@@ -14,22 +15,26 @@ from app.models import ActionModel
 from app.server import app
 
 
-# --- Load env ---
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
-API_BASE_URL = os.getenv("API_BASE_URL")
-MODEL_NAME = os.getenv("MODEL_NAME")
+API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4.1-mini")
 HF_TOKEN = os.getenv("HF_TOKEN")
+BENCHMARK = os.getenv("BENCHMARK", "procureflow")
+MAX_STEPS = int(os.getenv("MAX_STEPS", "6"))
+DEBUG_API = os.getenv("DEBUG_API", "0").lower() in {"1", "true", "yes"}
+
+if not HF_TOKEN:
+    raise ValueError("HF_TOKEN environment variable is required")
+
+CLIENT = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
 
 
-def _require_env(name: str, value: str | None) -> str:
-    if value:
-        return value
-    print(f"WARNING: {name} is missing. Performance will be degraded.")
-    return ""
+def _debug(message: str) -> None:
+    if DEBUG_API:
+        print(message, file=sys.stderr, flush=True)
 
 
-# --- Extract JSON safely ---
 def _extract_json(text: str) -> dict[str, Any]:
     text = text.strip()
 
@@ -44,7 +49,6 @@ def _extract_json(text: str) -> dict[str, Any]:
     return json.loads(match.group())
 
 
-# --- Prompt ---
 def _build_prompt(observation: dict[str, Any], state: dict[str, Any]) -> str:
     return (
         "Return ONLY a JSON object.\n\n"
@@ -59,7 +63,6 @@ def _build_prompt(observation: dict[str, Any], state: dict[str, Any]) -> str:
     )
 
 
-# --- Normalize (CORE FIX) ---
 def _normalize_action(payload: dict[str, Any]) -> dict[str, Any]:
     action_type = payload.get("action_type") or payload.get("action") or payload.get("type")
 
@@ -114,8 +117,7 @@ def _normalize_action(payload: dict[str, Any]) -> dict[str, Any]:
 
     try:
         return ActionModel(**normalized).model_dump()
-    except Exception as e:
-        print("NORMALIZATION ERROR:", normalized, e)
+    except Exception:
         return {
             "action_type": "request_info",
             "vendor_id": None,
@@ -132,6 +134,14 @@ def _heuristic_action(observation: dict[str, Any], state: dict[str, Any]) -> dic
             "action_type": "request_info",
             "message": f"Please provide: {', '.join(missing)}",
         }
+
+    selected_vendor = state.get("selected_vendor")
+    if selected_vendor:
+        budget = observation.get("budget", 0)
+        limit = observation.get("policy_limit", 0)
+        if budget <= limit:
+            return {"action_type": "approve", "decision": "approve"}
+        return {"action_type": "escalate", "decision": "escalate"}
 
     vendors = observation.get("vendors", [])
     if vendors:
@@ -157,87 +167,167 @@ def _heuristic_action(observation: dict[str, Any], state: dict[str, Any]) -> dic
     return {"action_type": "escalate", "decision": "escalate"}
 
 
-# --- LLM call ---
 def _next_action(observation: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
-    model = _require_env("MODEL_NAME", MODEL_NAME)
-    token = _require_env("HF_TOKEN", HF_TOKEN)
-    base = _require_env("API_BASE_URL", API_BASE_URL)
-
-    if not (model and token and base):
-        return _heuristic_action(observation, state)
-
     try:
-        client = OpenAI(api_key=token, base_url=base)
+        _debug("API_CALL building prompt")
         prompt = _build_prompt(observation, state)
 
-        response = client.chat.completions.create(
-            model=model,
+        _debug(f"API_CALL start model={MODEL_NAME} base_url={API_BASE_URL}")
+
+        response = CLIENT.chat.completions.create(
+            model=MODEL_NAME,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
             max_tokens=300,
             timeout=15,
         )
 
-        text = response.choices[0].message.content
-        print("RAW OUTPUT:", text)
+        _debug("API_CALL success")
+
+        text = response.choices[0].message.content or "{}"
+        _debug(f"API_CALL raw={text}")
 
         parsed = _extract_json(text)
-        return _normalize_action(parsed)
+        action = _normalize_action(parsed)
+
+        # Guardrails enforce valid stage transitions while still allowing model guidance.
+        vendors = observation.get("vendors", [])
+        has_missing_fields = bool(observation.get("missing_fields", []))
+        selected_vendor = state.get("selected_vendor")
+
+        # Easy-stage policy decision: action must be approve/escalate/reject.
+        if not has_missing_fields and not vendors and not selected_vendor:
+            if action.get("action_type") not in {"approve", "reject", "escalate"}:
+                budget = observation.get("budget", 0)
+                limit = observation.get("policy_limit", 0)
+                if budget <= limit:
+                    action = {"action_type": "approve", "decision": "approve"}
+                else:
+                    action = {"action_type": "escalate", "decision": "escalate"}
+
+        # Vendor-selection stage: action must choose a known vendor.
+        if vendors and not selected_vendor:
+            known_ids = {vendor.get("vendor_id") for vendor in vendors if isinstance(vendor, dict)}
+            if action.get("action_type") != "select_vendor" or action.get("vendor_id") not in known_ids:
+                valid_vendors = [v for v in vendors if v.get("rating", 0) >= 4.0]
+                if valid_vendors:
+                    best = min(valid_vendors, key=lambda x: x.get("price", float("inf")))
+                else:
+                    best = min(vendors, key=lambda x: x.get("price", float("inf")))
+                action = {"action_type": "select_vendor", "vendor_id": best.get("vendor_id")}
+
+        # Post-vendor stage: enforce final decision action.
+        if selected_vendor and action.get("action_type") not in {"approve", "reject", "escalate"}:
+            budget = observation.get("budget", 0)
+            limit = observation.get("policy_limit", 0)
+            if budget <= limit:
+                action = {"action_type": "approve", "decision": "approve"}
+            else:
+                action = {"action_type": "escalate", "decision": "escalate"}
+
+        return action
+
     except Exception as e:
-        print(f"LLM ERROR: {e}. Falling back to heuristic.")
+        _debug(f"API_CALL failed error={str(e)}")
         return _heuristic_action(observation, state)
 
+def _bool_str(value: bool) -> str:
+    return "true" if value else "false"
 
-# --- Run task ---
-def _run_task(api_client: TestClient, task_id: str, task_name: str) -> float:
-    print(f"[START] task={task_name}", flush=True)
 
-    reset = api_client.post("/reset", json={"task_id": task_id})
-    reset.raise_for_status()
+def _format_error(error: str | None) -> str:
+    if error is None:
+        return "null"
+    return error.replace("\n", " ").replace("\r", " ")
 
-    payload = reset.json()
-    observation = payload["observation"]
-    state = payload["state"]
 
+def _action_to_str(action: dict[str, Any]) -> str:
+    action_type = action.get("action_type", "request_info")
+    if action_type == "select_vendor":
+        vendor_id = action.get("vendor_id")
+        if vendor_id is None:
+            return "select_vendor()"
+        return f"select_vendor('{vendor_id}')"
+    if action_type in {"approve", "reject", "escalate"}:
+        return f"{action_type}()"
+    message = action.get("message")
+    if message is None:
+        return "request_info()"
+    safe_message = str(message).replace("'", "\\'")
+    return f"request_info('{safe_message}')"
+
+
+def _emit_start(task_name: str) -> None:
+    print(f"[START] task={task_name} env={BENCHMARK} model={MODEL_NAME}", flush=True)
+
+
+def _emit_step(step_num: int, action_str: str, reward: float, done: bool, error: str | None) -> None:
+    print(
+        f"[STEP] step={step_num} action={action_str} reward={reward:.2f} "
+        f"done={_bool_str(done)} error={_format_error(error)}",
+        flush=True,
+    )
+
+
+def _emit_end(success: bool, steps: int, rewards: list[float]) -> None:
+    reward_list = ",".join(f"{reward:.2f}" for reward in rewards)
+    print(f"[END] success={_bool_str(success)} steps={steps} rewards={reward_list}", flush=True)
+
+
+def _run_task(task_id: str, task_name: str) -> bool:
+    rewards: list[float] = []
     steps_taken = 0
-    for step_idx in range(1, 7):
-        action = _next_action(observation, state)
+    success = False
+    api_client = TestClient(app)
 
-        step = api_client.post("/step", json=action)
-        if step.status_code >= 400:
-            raise RuntimeError(f"Invalid action: {action} -> {step.text}")
+    try:
+        _emit_start(task_name)
+        reset = api_client.post("/reset", json={"task_id": task_id})
+        reset.raise_for_status()
 
-        step_data = step.json()
-        reward = float(step_data.get("reward", 0.0))
-        print(f"[STEP] task={task_name} step={step_idx} reward={reward}", flush=True)
+        payload = reset.json()
+        observation = payload["observation"]
+        state = payload["state"]
 
-        steps_taken = step_idx
-        observation = step_data["observation"]
-        state = step_data["state"]
+        for step_idx in range(1, MAX_STEPS + 1):
+            action = _next_action(observation, state)
+            step = api_client.post("/step", json=action)
 
-        if step_data["done"]:
-            break
+            if step.status_code >= 400:
+                raise RuntimeError(f"Invalid action: {action} -> {step.text}")
 
-    grader = api_client.post("/grader")
-    grader.raise_for_status()
+            step_data = step.json()
+            reward = float(step_data.get("reward", 0.0))
+            done = bool(step_data.get("done", False))
+            info = step_data.get("info", {})
+            error = info.get("error") if isinstance(info, dict) else None
 
-    score = float(grader.json()["score"])
-    print(f"[END] task={task_name} score={score} steps={steps_taken}", flush=True)
-    return score
+            _emit_step(step_idx, _action_to_str(action), reward, done, error)
+
+            rewards.append(reward)
+            steps_taken = step_idx
+            observation = step_data["observation"]
+            state = step_data["state"]
+
+            if done:
+                success = True
+                break
+    except Exception:
+        success = False
+    finally:
+        api_client.close()
+        _emit_end(success, steps_taken, rewards)
+
+    return success
 
 
-# --- Main ---
-def run_inference() -> dict[str, float]:
-    with TestClient(app) as api_client:
-        scores = {
-            "easy": _run_task(api_client, "easy_policy", "easy"),
-            "medium": _run_task(api_client, "medium_vendor_selection", "medium"),
-            "hard": _run_task(api_client, "hard_procurement_workflow", "hard"),
-        }
-
-    scores["average"] = sum(scores.values()) / len(scores)
-    return scores
+def run_inference() -> dict[str, bool]:
+    return {
+        "easy": _run_task("easy_policy", "easy"),
+        "medium": _run_task("medium_vendor_selection", "medium"),
+        "hard": _run_task("hard_procurement_workflow", "hard"),
+    }
 
 
 if __name__ == "__main__":
-    print(json.dumps(run_inference(), indent=2))
+    run_inference()
