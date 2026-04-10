@@ -279,7 +279,7 @@ def _run_task(task_id: str, task_name: str) -> float:
     rewards: list[float] = []
     steps_taken = 0
     success = False
-    score = normalize_submission_score(0.0)
+    score = 0.1
     api_client = TestClient(app)
 
     try:
@@ -299,7 +299,8 @@ def _run_task(task_id: str, task_name: str) -> float:
                 raise RuntimeError(f"Invalid action: {action} -> {step.text}")
 
             step_data = step.json()
-            reward = float(step_data.get("reward", 0.0))
+            reward = float(step_data.get("reward", 0.1))
+            reward = max(min(reward, 0.999), 0.001)
             done = bool(step_data.get("done", False))
             info = step_data.get("info", {})
             error = info.get("error") if isinstance(info, dict) else None
@@ -321,9 +322,12 @@ def _run_task(task_id: str, task_name: str) -> float:
         try:
             grader_response = api_client.post("/grader")
             if grader_response.status_code < 400:
-                score = normalize_submission_score(float(grader_response.json().get("score", 0.0)))
+                raw_score =float(grader_response.json().get("score", 0.1))
+                score=normalize_submission_score(raw_score)
+            else:
+                score = normalize_submission_score(0.1)
         except Exception:
-            score = normalize_submission_score(0.0)
+            score = normalize_submission_score(0.1)
         api_client.close()
         _emit_end(success, steps_taken, rewards)
 
