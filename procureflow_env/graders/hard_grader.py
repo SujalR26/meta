@@ -1,5 +1,6 @@
 """Deterministic grader for the hard task."""
 
+from app.scoring import normalize_submission_score
 from app.models import TaskData
 from app.state import RuntimeState
 
@@ -27,4 +28,4 @@ def grade_hard(task: TaskData, runtime_state: RuntimeState) -> float:
     ):
         score += 0.2
 
-    return min(score, 1.0)
+    return normalize_submission_score(score)
