@@ -26,7 +26,7 @@ def test_tasks_endpoint_returns_catalog() -> None:
 
 
 def test_easy_task_flow_scores_perfectly() -> None:
-    """The easy task should approve successfully and score 1.0."""
+    """The easy task should approve successfully and score just below 1.0."""
     reset_response = client.post("/reset", json={"task_id": "easy_policy"})
     assert reset_response.status_code == 200
 
@@ -41,7 +41,7 @@ def test_easy_task_flow_scores_perfectly() -> None:
 
     grader_response = client.post("/grader")
     assert grader_response.status_code == 200
-    assert grader_response.json()["score"] == 1.0
+    assert grader_response.json()["score"] == 0.999999
 
 
 def test_medium_task_second_best_vendor_scores_half() -> None:
@@ -64,7 +64,7 @@ def test_medium_task_second_best_vendor_scores_half() -> None:
 
 
 def test_hard_task_multistep_flow_scores_perfectly() -> None:
-    """The hard task should reward correct multi-step progress and end at 1.0."""
+    """The hard task should reward correct multi-step progress and end just below 1.0."""
     reset_response = client.post("/reset", json={"task_id": "hard_procurement_workflow"})
     assert reset_response.status_code == 200
     reset_payload = reset_response.json()
@@ -101,7 +101,7 @@ def test_hard_task_multistep_flow_scores_perfectly() -> None:
 
     grader_response = client.post("/grader")
     assert grader_response.status_code == 200
-    assert grader_response.json()["score"] == 1.0
+    assert grader_response.json()["score"] == 0.999999
 
 
 def test_invalid_hard_task_action_is_rejected_with_penalty() -> None:
@@ -121,12 +121,12 @@ def test_invalid_hard_task_action_is_rejected_with_penalty() -> None:
 
 
 def test_local_baseline_endpoint_returns_perfect_scores() -> None:
-    """The local heuristic baseline endpoint should return deterministic perfect scores."""
+    """The local heuristic baseline endpoint should return submission-safe near-perfect scores."""
     response = client.post("/baseline")
     assert response.status_code == 200
     assert response.json() == {
-        "easy": 1.0,
-        "medium": 1.0,
-        "hard": 1.0,
-        "average": 1.0,
+        "easy": 0.999999,
+        "medium": 0.999999,
+        "hard": 0.999999,
+        "average": 0.999999,
     }

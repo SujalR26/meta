@@ -6,6 +6,7 @@ from copy import deepcopy
 from typing import Any
 
 from app.models import ActionModel, ObservationModel, StateModel, TaskData, VendorQuote
+from app.scoring import normalize_submission_score
 from app.reward import (
     final_decision_reward,
     intermediate_progress_reward,
@@ -90,10 +91,12 @@ class ProcureFlowEnv:
     def grade(self) -> float:
         """Run the deterministic task-specific grader against the current episode."""
         if self._current_task.difficulty == "easy":
-            return grade_easy(self._current_task, self._runtime_state)
-        if self._current_task.difficulty == "medium":
-            return grade_medium(self._current_task, self._runtime_state)
-        return grade_hard(self._current_task, self._runtime_state)
+            raw_score = grade_easy(self._current_task, self._runtime_state)
+        elif self._current_task.difficulty == "medium":
+            raw_score = grade_medium(self._current_task, self._runtime_state)
+        else:
+            raw_score = grade_hard(self._current_task, self._runtime_state)
+        return normalize_submission_score(raw_score)
 
     def _build_observation(self) -> ObservationModel:
         """Construct the current observation."""
