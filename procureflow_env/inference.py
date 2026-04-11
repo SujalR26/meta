@@ -322,8 +322,8 @@ def _run_task(task_id: str, task_name: str) -> float:
         try:
             grader_response = api_client.post("/grader")
             if grader_response.status_code < 400:
-                raw_score =float(grader_response.json().get("score", 0.1))
-                score=normalize_submission_score(raw_score)
+                raw_score = float(grader_response.json().get("score", 0.1))
+                score = normalize_submission_score(raw_score)
             else:
                 score = normalize_submission_score(0.1)
         except Exception:

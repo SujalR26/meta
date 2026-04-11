@@ -1,23 +1,25 @@
-from __future__ import annotations
-from math import isfinite
+"""Scoring utilities for ProcureFlow grader responses."""
 
-_EPSILON = 1e-6
+from __future__ import annotations
+
 
 def normalize_submission_score(score: float) -> float:
-    """Ensure score lies strictly in (0, 1)."""
-    if not isfinite(score):
-        raise ValueError("Score must be finite.")
-
-    # Soft clamp instead of hard edges
+    """Ensure score is strictly within open interval (0, 1).
+    
+    Maps boundary values to values just inside the interval to satisfy
+    validation requirements: score > 0.0 and score < 1.0
+    """
+    epsilon = 1e-6
+    
     if score <= 0.0:
-        return _EPSILON
+        return epsilon
     if score >= 1.0:
-        return 1.0 - _EPSILON
-
-    # Extra safety against rounding issues
-    if score < _EPSILON:
-        return _EPSILON
-    if score > 1.0 - _EPSILON:
-        return 1.0 - _EPSILON
-
+        return 1.0 - epsilon
+    
+    # Extra safety against edge cases from floating point arithmetic
+    if score < epsilon:
+        return epsilon
+    if score > 1.0 - epsilon:
+        return 1.0 - epsilon
+    
     return score
